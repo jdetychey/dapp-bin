@@ -49,167 +49,6 @@
 /// Disclaimer: This has not been tested and is only meant as a proof of concept
 /// and a way to compute the gas costs.
 pragma solidity ^0.4.9;
-contract ScryptVerifier {
-    
-    struct VerificationSession {
-        address claimant;
-        address challenger;
-        bytes data;
-        bytes32 hash;
-        uint16[] queries;
-        uint[4][] values;
-    }
-    VerificationSession[] sessions;
-
-    /// Claim that scrypt(data) == hash. With reference to above,
-    /// values[0] = pbkdf2(data) (the "input") and
-    /// pbkdf2(values[2048]) should be equal to hash, values[2048] is called "output".
-    function claimComputation(bytes _data, bytes32 _hash) {
-        sessions.push(VerificationSession({
-            claimant: msg.sender,
-            challenger: address(0),
-            data: _data,
-            hash: _hash,
-            queries: new uint16[](0),
-            values: new uint[4][](0)
-        }));
-        NewClaim(sessions.length - 1);
-    }
-    event NewClaim(uint sessionId);
-    event Convicted(uint sessionId);
-    event NewQuery(uint sessionId);
-    event NewResponse(uint sessionId);
-
-    modifier onlyClaimant(uint id) { if (msg.sender != sessions[id].claimant) throw; _ ;}
-    modifier onlyChallenger(uint id) {
-        var session = sessions[id];
-        if (session.challenger == 0) session.challenger = msg.sender;
-        else if (msg.sender != session.challenger) throw;
-        _;
-    }
-
-    /// Challenger queries claimant for the value on a wire `_i`.
-    /// Value 0 is the input, value 1024 is the first input to the second
-    /// half of the computation, value 2048 is the output.
-    function query(uint session, uint16 _i) onlyChallenger(session) {
-        if (_i > 2048) throw;
-        sessions[session].queries.push(_i);
-        NewQuery(session);
-    }
-
-    /// Claimant responds to challenge, committing to a value.
-    function respond(uint session, uint[4] _value) onlyClaimant(session) {
-        var s = sessions[session];
-        if (s.values.length >= s.queries.length) throw;
-        s.values.push(_value);
-        NewResponse(session);
-    }
-
-    /// Convicts the claimant to have provided inputs and outputs for a single
-    /// step that do not match the computation of the step.
-    /// q1, q2 and q3 are query indices providing the relevant values.
-    /// q1 is the query index of the first input, q2 the query index of
-    /// the output and q2 is the query index of the auxiliary input only
-    /// used in the second half of the scrypt computation.
-    function convict(uint session, uint q1, uint q2, uint q3) onlyChallenger(session) {
-        var s = sessions[session];
-        var i = s.queries[q1];
-        if (s.queries[q2] != i + 1) throw;
-        var input = s.values[q1];
-        var output = s.values[q2];
-        if (i < 1024) {
-            if (!verifyFirstHalf(input, output))
-                Convicted(session);
-        } else {
-            var auxIndex = s.queries[q3];
-            if (auxIndex != (input[2] / 0x100000000000000000000000000000000000000000000000000000000) % 1024)
-                throw;
-            var auxInput = s.values[q3];
-            if (!verifySecondHalf(input, auxInput, output))
-                Convicted(session);
-        }
-    }
-
-    /// Convicts the claimant to have provided an incorrect value for value[0].
-    function convictInitial(uint session, uint q) onlyChallenger(session) {
-        var s = sessions[session];
-        if (s.queries[q] != 0) throw;
-        var v = s.values[q];
-        var h = KeyDeriv.pbkdf2(s.data, s.data, 128);
-        if (uint(h[0]) != v[0] || uint(h[1]) != v[1] || uint(h[2]) != v[2] || uint(h[3]) != v[3])
-            Convicted(session);
-    }
-
-    /// Convicts the claimant to have provided an incorrect value for value[2048].
-    function convictFinal(uint session, uint q) onlyChallenger(session) {
-        var s = sessions[session];
-        if (s.queries[q] != 2048) throw;
-        var v = s.values[q];
-        bytes memory val = new bytes(128);
-        for (uint i = 0; i < 128; i ++)
-            val[i] = byte(uint8(v[i / 32] / 2**((32 - (i % 32)) * 8)));
-        var h = KeyDeriv.pbkdf2(val, val, 32);
-        if (h[0] != s.hash)
-            Convicted(session);
-    }
-
-    /// Verifies a salsa step in the first half of the scrypt computation.
-    function verifyFirstHalf(uint[4] input, uint[4] output) constant returns (bool) {
-        var (a, b, c, d) = Salsa8.round(input[0], input[1], input[2], input[3]);
-        return (a == output[0] && b == output[1] && c == output[2] && d == output[3]);
-    }
-    /// Verifies a salsa step in the second half of the scrypt computation.
-    function verifySecondHalf(uint[4] input, uint[4] vinput, uint[4] output) constant returns (bool) {
-        input[0] ^= vinput[0];
-        input[1] ^= vinput[1];
-        input[2] ^= vinput[2];
-        input[3] ^= vinput[3];
-        return verifyFirstHalf(input, output);
-    }
-
-    // /// This function can be used to compute the correct response to a
-    // /// challenge. It is only intended to be called without a transaction
-    // /// because it consumes tremendous amounts of gas.
-    // function computeResponse(uint16 _i) constant returns (uint[4]) {
-    //     if (_i <= 1024)
-    //         return computeResponseFirstHalf(_i);
-    //     else
-    //         return computeResponseSecondHalf(_i);
-    // }
-    // function computeResponseSecondHalf(uint16 _i) constant returns (uint[4]) {
-    //     uint[4 * 1024] memory lookup;
-    //     uint a = values[0][0];
-    //     uint b = values[0][1];
-    //     uint c = values[0][2];
-    //     uint d = values[0][3];
-    //     uint l = 0;
-    //     lookup[l++] = a;
-    //     lookup[l++] = b;
-    //     lookup[l++] = c;
-    //     lookup[l++] = d;
-    //     for (uint16 i = 1; i <= 1024; i++) {
-    //         (a, b, c, d) = Salsa8.round(a, b, c, d);
-    //         lookup[l++] = a;
-    //         lookup[l++] = b;
-    //         lookup[l++] = c;
-    //         lookup[l++] = d;
-    //     }
-    //     for (; i <= _i; i++) {
-    //         uint auxIndex = ((c / 0x100000000000000000000000000000000000000000000000000000000) % 1024) * 4;
-    //         (a, b, c, d) = Salsa8.round(a ^ lookup[auxIndex], b ^ lookup[auxIndex + 1], c ^ lookup[auxIndex + 2], d ^ lookup[auxIndex + 3]);
-    //     }
-    //     return [a, b, c, d];
-    // }
-    // function computeResponseFirstHalf(uint16 _i) constant internal returns (uint[4]) {
-    //     uint a = values[0][0];
-    //     uint b = values[0][1];
-    //     uint c = values[0][2];
-    //     uint d = values[0][3];
-    //     for (uint16 i = 1; i <= _i; i++)
-    //         (a, b, c, d) = Salsa8.round(a, b, c, d);
-    //     return [a, b, c, d];
-    // }
-}
 
 library Salsa8 {
     uint constant m0 = 0x100000000000000000000000000000000000000000000000000000000;
@@ -315,3 +154,173 @@ library KeyDeriv {
         }
     }
 }
+contract ScryptVerifier {
+    
+    using Salsa8 for *;
+    using KeyDeriv for *; 
+
+    struct VerificationSession {
+        address claimant;
+        address challenger;
+        bytes data;
+        bytes32 hash;
+        uint16[] queries;
+        uint[4][] values;
+    }
+    VerificationSession[] sessions;
+
+    /// Claim that scrypt(data) == hash. With reference to above,
+    /// values[0] = pbkdf2(data) (the "input") and
+    /// pbkdf2(values[2048]) should be equal to hash, values[2048] is called "output".
+    
+    event NewClaim(uint sessionId);
+    event Convicted(uint sessionId);
+    event NewQuery(uint sessionId);
+    event NewResponse(uint sessionId);
+    
+    function claimComputation(bytes _data, bytes32 _hash) {
+        sessions.push(VerificationSession({
+            claimant: msg.sender,
+            challenger: address(0),
+            data: _data,
+            hash: _hash,
+            queries: new uint16[](0),
+            values: new uint[4][](0)
+        }));
+        NewClaim(sessions.length - 1);
+    }
+
+    modifier onlyClaimant(uint id) { if (msg.sender != sessions[id].claimant) throw; _ ;}
+    modifier onlyChallenger(uint id) {
+        var session = sessions[id];
+        if (session.challenger == 0) session.challenger = msg.sender;
+        else if (msg.sender != session.challenger) throw;
+        _;
+    }
+
+    /// Challenger queries claimant for the value on a wire `_i`.
+    /// Value 0 is the input, value 1024 is the first input to the second
+    /// half of the computation, value 2048 is the output.
+    function query(uint session, uint16 _i) onlyChallenger(session) {
+        if (_i > 2048) throw;
+        sessions[session].queries.push(_i);
+        NewQuery(session);
+    }
+
+    /// Claimant responds to challenge, committing to a value.
+    function respond(uint session, uint[4] _value) onlyClaimant(session) {
+        var s = sessions[session];
+        if (s.values.length >= s.queries.length) throw;
+        s.values.push(_value);
+        NewResponse(session);
+    }
+
+    /// Convicts the claimant to have provided inputs and outputs for a single
+    /// step that do not match the computation of the step.
+    /// q1, q2 and q3 are query indices providing the relevant values.
+    /// q1 is the query index of the first input, q2 the query index of
+    /// the output and q2 is the query index of the auxiliary input only
+    /// used in the second half of the scrypt computation.
+    function convict(uint session, uint q1, uint q2, uint q3) onlyChallenger(session) {
+        var s = sessions[session];
+        var i = s.queries[q1];
+        if (s.queries[q2] != i + 1) throw;
+        var input = s.values[q1];
+        var output = s.values[q2];
+        if (i < 1024) {
+            if (!verifyFirstHalf(input, output))
+                Convicted(session);
+        } else {
+            var auxIndex = s.queries[q3];
+            if (auxIndex != (input[2] / 0x100000000000000000000000000000000000000000000000000000000) % 1024)
+                throw;
+            var auxInput = s.values[q3];
+            if (!verifySecondHalf(input, auxInput, output))
+                Convicted(session);
+        }
+    }
+
+    /// Convicts the claimant to have provided an incorrect value for value[0].
+    function convictInitial(uint session, uint q) onlyChallenger(session) {
+        var s = sessions[session];
+        if (s.queries[q] != 0) throw;
+        var v = s.values[q];
+        var h = KeyDeriv.pbkdf2(s.data, s.data, 128);
+        if (uint(h[0]) != v[0] || uint(h[1]) != v[1] || uint(h[2]) != v[2] || uint(h[3]) != v[3])
+            Convicted(session);
+    }
+
+    /// Convicts the claimant to have provided an incorrect value for value[2048].
+    function convictFinal(uint session, uint q) onlyChallenger(session) {
+        var s = sessions[session];
+        if (s.queries[q] != 2048) throw;
+        var v = s.values[q];
+        bytes memory val = new bytes(128);
+        for (uint i = 0; i < 128; i ++)
+            val[i] = byte(uint8(v[i / 32] / 2**((32 - (i % 32)) * 8)));
+        var h = KeyDeriv.pbkdf2(val, val, 32);
+        if (h[0] != s.hash)
+            Convicted(session);
+    }
+
+    /// Verifies a salsa step in the first half of the scrypt computation.
+    function verifyFirstHalf(uint[4] input, uint[4] output) constant returns (bool) {
+        var (a, b, c, d) = Salsa8.round(input[0], input[1], input[2], input[3]);
+        return (a == output[0] && b == output[1] && c == output[2] && d == output[3]);
+    }
+    /// Verifies a salsa step in the second half of the scrypt computation.
+    function verifySecondHalf(uint[4] input, uint[4] vinput, uint[4] output) constant returns (bool) {
+        input[0] ^= vinput[0];
+        input[1] ^= vinput[1];
+        input[2] ^= vinput[2];
+        input[3] ^= vinput[3];
+        return verifyFirstHalf(input, output);
+    }
+
+    // /// This function can be used to compute the correct response to a
+    // /// challenge. It is only intended to be called without a transaction
+    // /// because it consumes tremendous amounts of gas.
+   /*  function computeResponse(uint16 _i) constant returns (uint[4]) {
+         if (_i <= 1024)
+             return computeResponseFirstHalf(_i);
+         else
+             return computeResponseSecondHalf(_i);
+     }
+     function computeResponseSecondHalf(uint16 _i) constant returns (uint[4]) {
+         uint[4 * 1024] memory lookup;
+         uint a = values[0][0];
+         uint b = values[0][1];
+         uint c = values[0][2];
+         uint d = values[0][3];
+         uint l = 0;
+         lookup[l++] = a;
+         lookup[l++] = b;
+         lookup[l++] = c;
+         lookup[l++] = d;
+         for (uint16 i = 1; i <= 1024; i++) {
+             (a, b, c, d) = Salsa8.round(a, b, c, d);
+             lookup[l++] = a;
+             lookup[l++] = b;
+             lookup[l++] = c;
+             lookup[l++] = d;
+         }
+         for (; i <= _i; i++) {
+             uint auxIndex = ((c / 0x100000000000000000000000000000000000000000000000000000000) % 1024) * 4;
+             (a, b, c, d) = Salsa8.round(a ^ lookup[auxIndex], b ^ lookup[auxIndex + 1], c ^ lookup[auxIndex + 2], d ^ lookup[auxIndex + 3]);
+         }
+         return [a, b, c, d];
+     }
+     function computeResponseFirstHalf(uint16 _i) constant internal returns (uint[4]) {
+         uint a = values[0][0];
+         uint b = values[0][1];
+         uint c = values[0][2];
+         uint d = values[0][3];
+         for (uint16 i = 1; i <= _i; i++)
+             (a, b, c, d) = Salsa8.round(a, b, c, d);
+         return [a, b, c, d];
+     }
+     */
+    
+}
+       
+    
